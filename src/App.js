@@ -392,7 +392,7 @@ function MainApp({ token, userMeta, onLogout }) {
     setLoading(true); setDbError(null);
     try {
       const siteParam = userMeta?.site_id ? `?id=eq.${userMeta.site_id}` : "?order=name";
-      const staffParam = userMeta?.site_id ? `?site_id=eq.${userMeta.site_id}&active=eq.true&order=name` : "?active=eq.true&order=name";
+      const staffParam = userMeta?.site_id ? `?site_id=eq.${userMeta.site_id}&active=eq.true&order=name&limit=1000` : "?active=eq.true&order=name&limit=1000";
       const [sitesData, staffData, attData] = await Promise.all([
         db.get("sites", siteParam),
         db.get("staff", staffParam),
