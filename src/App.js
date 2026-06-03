@@ -1,25 +1,732 @@
-import logo from './logo.svg';
-import './App.css';
+import { useState, useEffect, useCallback } from "react";
 
-function App() {
+// ── Supabase Config ───────────────────────────────────────────────────────────
+const SUPABASE_URL = "https://xvnkvdyamrqiialxunmy.supabase.co";
+const SUPABASE_KEY = "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6Inh2bmt2ZHlhbXJxaWlhbHh1bm15Iiwicm9sZSI6ImFub24iLCJpYXQiOjE3ODA1MTg4NzYsImV4cCI6MjA5NjA5NDg3Nn0.agl6CVdTDZc6KALdxOD7luh1Nl3Ri3EBzQPnMMdD3Yg";
+
+const db = {
+  async get(table, params = "") {
+    const res = await fetch(`${SUPABASE_URL}/rest/v1/${table}${params}`, {
+      headers: {
+        apikey: SUPABASE_KEY,
+        Authorization: `Bearer ${SUPABASE_KEY}`,
+        "Content-Type": "application/json",
+      },
+    });
+    if (!res.ok) throw new Error(`GET ${table} failed: ${res.status}`);
+    return res.json();
+  },
+  async post(table, body) {
+    const res = await fetch(`${SUPABASE_URL}/rest/v1/${table}`, {
+      method: "POST",
+      headers: {
+        apikey: SUPABASE_KEY,
+        Authorization: `Bearer ${SUPABASE_KEY}`,
+        "Content-Type": "application/json",
+        Prefer: "return=representation",
+      },
+      body: JSON.stringify(body),
+    });
+    if (!res.ok) throw new Error(`POST ${table} failed: ${res.status}`);
+    return res.json();
+  },
+  async patch(table, id, body) {
+    const res = await fetch(`${SUPABASE_URL}/rest/v1/${table}?id=eq.${id}`, {
+      method: "PATCH",
+      headers: {
+        apikey: SUPABASE_KEY,
+        Authorization: `Bearer ${SUPABASE_KEY}`,
+        "Content-Type": "application/json",
+        Prefer: "return=representation",
+      },
+      body: JSON.stringify(body),
+    });
+    if (!res.ok) throw new Error(`PATCH ${table} failed: ${res.status}`);
+    return res.json();
+  },
+};
+
+// ── Helpers ───────────────────────────────────────────────────────────────────
+const todayStr = () => new Date().toISOString().split("T")[0];
+const fmt = h => h == null ? "—" : `${Math.floor(h)}h ${Math.round((h % 1) * 60)}m`;
+const fmtDate = d => new Date(d + "T00:00:00").toLocaleDateString("en-GB", { weekday: "short", day: "numeric", month: "short" });
+const initials = name => name.split(" ").map(w => w[0]).join("").slice(0, 2).toUpperCase();
+const timeStr = () => {
+  const now = new Date();
+  return `${String(now.getHours()).padStart(2, "0")}:${String(now.getMinutes()).padStart(2, "0")}`;
+};
+
+// ── App ───────────────────────────────────────────────────────────────────────
+export default function App() {
+  const [view, setView] = useState("dashboard");
+  const [sites, setSites] = useState([]);
+  const [staff, setStaff] = useState([]);
+  const [attendance, setAttendance] = useState([]);
+  const [clockedIn, setClockedIn] = useState({}); // staffId -> {time, attendanceId}
+  const [loading, setLoading] = useState(true);
+  const [dbError, setDbError] = useState(null);
+  const [selectedSite, setSelectedSite] = useState(null);
+  const [pinModal, setPinModal] = useState(false);
+  const [pinEntry, setPinEntry] = useState("");
+  const [pinError, setPinError] = useState("");
+  const [pinAction, setPinAction] = useState(null);
+  const [notification, setNotification] = useState(null);
+  const [staffFilter, setStaffFilter] = useState("");
+  const [siteFilter, setSiteFilter] = useState("all");
+  const [approveMode, setApproveMode] = useState(false);
+  const [time, setTime] = useState(new Date());
+
+  useEffect(() => {
+    const t = setInterval(() => setTime(new Date()), 1000);
+    return () => clearInterval(t);
+  }, []);
+
+  // Load data from Supabase
+  const loadData = useCallback(async () => {
+    setLoading(true);
+    setDbError(null);
+    try {
+      const [sitesData, staffData, attendanceData] = await Promise.all([
+        db.get("sites", "?order=name"),
+        db.get("staff", "?order=name&active=eq.true"),
+        db.get("attendance", `?date=gte.${new Date(Date.now() - 7 * 86400000).toISOString().split("T")[0]}&order=date.desc`),
+      ]);
+      setSites(sitesData);
+      setStaff(staffData);
+      setAttendance(attendanceData);
+
+      // Restore clocked-in state from today's open records
+      const openToday = attendanceData.filter(r => r.date === todayStr() && !r.clock_out);
+      const ci = {};
+      openToday.forEach(r => { ci[r.staff_id] = { time: r.clock_in?.slice(0, 5), attendanceId: r.id }; });
+      setClockedIn(ci);
+    } catch (e) {
+      setDbError(e.message);
+    } finally {
+      setLoading(false);
+    }
+  }, []);
+
+  useEffect(() => { loadData(); }, [loadData]);
+
+  const notify = (msg, type = "success") => {
+    setNotification({ msg, type });
+    setTimeout(() => setNotification(null), 3500);
+  };
+
+  const handleClockAction = (action) => {
+    setPinAction(action); setPinEntry(""); setPinError(""); setPinModal(true);
+  };
+
+  const submitPin = async () => {
+    const member = staff.find(s =>
+      s.pin === pinEntry && (selectedSite == null || s.site_id === selectedSite)
+    );
+    if (!member) { setPinError("PIN not recognised — try again"); return; }
+
+    const now = timeStr();
+    const date = todayStr();
+
+    try {
+      if (pinAction === "in") {
+        if (clockedIn[member.id]) { setPinError(`${member.name} is already clocked in`); return; }
+        const [rec] = await db.post("attendance", {
+          staff_id: member.id,
+          site_id: member.site_id,
+          date,
+          clock_in: now,
+          break_minutes: 30,
+          approved: false,
+        });
+        setClockedIn(p => ({ ...p, [member.id]: { time: now, attendanceId: rec.id } }));
+        setAttendance(p => [rec, ...p]);
+        notify(`✓ ${member.name} clocked IN at ${now}`);
+      } else {
+        if (!clockedIn[member.id]) { setPinError(`${member.name} is not clocked in`); return; }
+        const inData = clockedIn[member.id];
+        const [inH, inM] = inData.time.split(":").map(Number);
+        const [outH, outM] = now.split(":").map(Number);
+        const gross = parseFloat(((outH + outM / 60) - (inH + inM / 60)).toFixed(2));
+        const net = parseFloat((gross - 0.5).toFixed(2));
+        const [updated] = await db.patch("attendance", inData.attendanceId, {
+          clock_out: now,
+          gross_hours: gross,
+          net_hours: net,
+        });
+        setClockedIn(p => { const n = { ...p }; delete n[member.id]; return n; });
+        setAttendance(p => p.map(r => r.id === inData.attendanceId ? updated : r));
+        notify(`✓ ${member.name} clocked OUT — ${fmt(net)} worked`);
+      }
+    } catch (e) {
+      setPinError("Database error — check connection");
+      console.error(e);
+    }
+    setPinModal(false);
+  };
+
+  const approveRecord = async (recId) => {
+    try {
+      const [updated] = await db.patch("attendance", recId, {
+        approved: true,
+        approved_at: new Date().toISOString(),
+      });
+      setAttendance(p => p.map(r => r.id === recId ? updated : r));
+      notify("Record approved ✓");
+    } catch (e) {
+      notify("Approval failed", "error");
+    }
+  };
+
+  const exportCSV = () => {
+    const filteredAtt = selectedSite != null
+      ? attendance.filter(r => r.site_id === selectedSite)
+      : attendance;
+    const rows = [["Employee", "Role", "Site", "Date", "Clock In", "Clock Out", "Gross Hours", "Break (mins)", "Net Hours", "Approved"]];
+    filteredAtt.forEach(r => {
+      const s = staff.find(x => x.id === r.staff_id);
+      const site = sites.find(x => x.id === r.site_id);
+      if (!s) return;
+      rows.push([s.name, s.role || "", site?.name || "", r.date,
+        r.clock_in?.slice(0, 5) || "", r.clock_out?.slice(0, 5) || "",
+        r.gross_hours || "", r.break_minutes || 30, r.net_hours || "",
+        r.approved ? "Yes" : "No"]);
+    });
+    const csv = rows.map(r => r.join(",")).join("\n");
+    const a = document.createElement("a");
+    a.href = URL.createObjectURL(new Blob([csv], { type: "text/csv" }));
+    a.download = `attendance_${selectedSite != null ? sites.find(s => s.id === selectedSite)?.name?.replace(/\s/g, "_") : "all_sites"}_${todayStr()}.csv`;
+    a.click();
+    notify("BrightPay CSV exported ✓");
+  };
+
+  // Stats
+  const totalClockedIn = Object.keys(clockedIn).length;
+  const todayRecs = attendance.filter(r => r.date === todayStr() && r.clock_out);
+  const pendingApprovals = attendance.filter(r => !r.approved && r.clock_out).length;
+  const weekHours = attendance.reduce((sum, r) => sum + (r.net_hours || 0), 0);
+
+  const filteredStaff = staff.filter(s => {
+    const matchSite = siteFilter === "all" || s.site_id === parseInt(siteFilter);
+    const matchName = s.name.toLowerCase().includes(staffFilter.toLowerCase()) ||
+      (s.role || "").toLowerCase().includes(staffFilter.toLowerCase());
+    return matchSite && matchName;
+  });
+
+  const navItems = [
+    { id: "dashboard", label: "Dashboard", icon: "⬡" },
+    { id: "clock", label: "Clock In/Out", icon: "◎" },
+    { id: "staff", label: "Staff", icon: "◈" },
+    { id: "timesheets", label: "Timesheets", icon: "▦" },
+    { id: "sites", label: "Sites", icon: "◉" },
+    { id: "reports", label: "Reports", icon: "▤" },
+  ];
+
+  if (loading) return (
+    <div style={{ ...S.root, alignItems: "center", justifyContent: "center", flexDirection: "column", gap: 16 }}>
+      <div style={S.spinner} />
+      <div style={{ color: "#555570", fontSize: 13 }}>Connecting to Supabase…</div>
+    </div>
+  );
+
+  if (dbError) return (
+    <div style={{ ...S.root, alignItems: "center", justifyContent: "center", flexDirection: "column", gap: 16, padding: 40 }}>
+      <div style={{ fontSize: 32 }}>⚠️</div>
+      <div style={{ color: "#ff6b6b", fontWeight: 700, fontSize: 16 }}>Database connection failed</div>
+      <div style={{ color: "#555570", fontSize: 13, maxWidth: 400, textAlign: "center" }}>{dbError}</div>
+      <div style={{ color: "#444458", fontSize: 12, textAlign: "center", maxWidth: 400 }}>
+        Make sure you've run the SQL schema in Supabase → SQL Editor first, then click retry.
+      </div>
+      <button style={S.exportBtn} onClick={loadData}>Retry Connection</button>
+    </div>
+  );
+
   return (
-    <div className="App">
-      <header className="App-header">
-        <img src={logo} className="App-logo" alt="logo" />
-        <p>
-          Edit <code>src/App.js</code> and save to reload.
-        </p>
-        <a
-          className="App-link"
-          href="https://reactjs.org"
-          target="_blank"
-          rel="noopener noreferrer"
-        >
-          Learn React
-        </a>
-      </header>
+    <div style={S.root}>
+      <style>{css}</style>
+
+      {notification && (
+        <div style={{ ...S.notif, background: notification.type === "success" ? "#00c896" : "#ff4d4d" }}>
+          {notification.msg}
+        </div>
+      )}
+
+      {pinModal && (
+        <div style={S.overlay}>
+          <div style={S.modal}>
+            <div style={S.modalTitle}>{pinAction === "in" ? "CLOCK IN" : "CLOCK OUT"}</div>
+            <div style={S.clockTime}>{time.toLocaleTimeString("en-GB", { hour: "2-digit", minute: "2-digit", second: "2-digit" })}</div>
+            <div style={S.pinDisplay}>
+              {Array.from({ length: 4 }).map((_, i) => (
+                <div key={i} style={{ ...S.pinDot, background: i < pinEntry.length ? "#00c896" : "transparent" }} />
+              ))}
+            </div>
+            {pinError && <div style={S.pinError}>{pinError}</div>}
+            <div style={S.pinGrid}>
+              {[1, 2, 3, 4, 5, 6, 7, 8, 9, "←", 0, "✓"].map(k => (
+                <button key={k} style={S.pinBtn} className="pin-btn" onClick={() => {
+                  if (k === "←") setPinEntry(p => p.slice(0, -1));
+                  else if (k === "✓") submitPin();
+                  else if (pinEntry.length < 4) setPinEntry(p => p + k);
+                }}>{k}</button>
+              ))}
+            </div>
+            <button style={S.cancelBtn} onClick={() => setPinModal(false)}>Cancel</button>
+          </div>
+        </div>
+      )}
+
+      {/* Sidebar */}
+      <aside style={S.sidebar}>
+        <div style={S.logo}>
+          <span style={S.logoIcon}>Rx</span>
+          <div>
+            <div style={S.logoName}>PharmaClock</div>
+            <div style={S.logoSub}>Roshban Group</div>
+          </div>
+        </div>
+        <nav style={S.nav}>
+          {navItems.map(n => (
+            <button key={n.id} style={{ ...S.navItem, ...(view === n.id ? S.navActive : {}) }}
+              className="nav-item" onClick={() => setView(n.id)}>
+              <span style={S.navIcon}>{n.icon}</span>
+              {n.label}
+              {n.id === "timesheets" && pendingApprovals > 0 && (
+                <span style={S.badge}>{pendingApprovals}</span>
+              )}
+            </button>
+          ))}
+        </nav>
+        <div style={S.sidebarBottom}>
+          <div style={S.sidebarStat}><span style={S.sidebarStatNum}>{totalClockedIn}</span> clocked in now</div>
+          <div style={S.sidebarStat}><span style={S.sidebarStatNum}>{staff.length}</span> total staff</div>
+          <div style={S.sidebarStat}><span style={S.sidebarStatNum}>{sites.length}</span> sites</div>
+          <div style={{ marginTop: 8, cursor: "pointer", color: "#4da6ff", fontSize: 11 }} onClick={loadData}>↻ Refresh</div>
+        </div>
+      </aside>
+
+      {/* Main */}
+      <main style={S.main}>
+        <div style={S.header}>
+          <div>
+            <div style={S.headerTitle}>
+              {{ dashboard: "Overview", clock: "Clock In / Out", staff: "Staff Directory", timesheets: "Timesheets", sites: "Sites", reports: "Reports & Export" }[view]}
+            </div>
+            <div style={S.headerDate}>
+              {time.toLocaleDateString("en-GB", { weekday: "long", day: "numeric", month: "long", year: "numeric" })}
+              {" · "}{time.toLocaleTimeString("en-GB", { hour: "2-digit", minute: "2-digit" })}
+            </div>
+          </div>
+          <button style={S.exportBtn} className="export-btn" onClick={exportCSV}>↓ BrightPay CSV</button>
+        </div>
+
+        {/* DASHBOARD */}
+        {view === "dashboard" && (
+          <div style={S.content}>
+            <div style={S.statsRow}>
+              {[
+                { label: "Clocked In Now", val: totalClockedIn, sub: `of ${staff.length} staff`, color: "#00c896" },
+                { label: "Today's Shifts", val: todayRecs.length, sub: "completed today", color: "#4da6ff" },
+                { label: "Pending Approvals", val: pendingApprovals, sub: "need sign-off", color: pendingApprovals > 0 ? "#ffb84d" : "#00c896" },
+                { label: "Week Net Hours", val: Math.round(weekHours), sub: "across all sites", color: "#c084fc" },
+              ].map(s => (
+                <div key={s.label} style={S.statCard} className="stat-card">
+                  <div style={{ ...S.statNum, color: s.color }}>{s.val}</div>
+                  <div style={S.statLabel}>{s.label}</div>
+                  <div style={S.statSub}>{s.sub}</div>
+                </div>
+              ))}
+            </div>
+            <div style={S.twoCol}>
+              <div style={S.card}>
+                <div style={S.cardTitle}>Currently Clocked In</div>
+                <div style={S.liveList}>
+                  {Object.keys(clockedIn).length === 0 && <div style={S.empty}>No one clocked in yet today</div>}
+                  {Object.entries(clockedIn).map(([id, data]) => {
+                    const s = staff.find(x => x.id === parseInt(id));
+                    if (!s) return null;
+                    const site = sites.find(x => x.id === s.site_id);
+                    return (
+                      <div key={id} style={S.liveRow}>
+                        <div style={S.liveAvatar}>{initials(s.name)}</div>
+                        <div style={{ flex: 1 }}>
+                          <div style={S.liveName}>{s.name}</div>
+                          <div style={S.liveSub}>{s.role} · {site?.name}</div>
+                        </div>
+                        <div style={S.liveTime}>since {data.time}</div>
+                      </div>
+                    );
+                  })}
+                </div>
+              </div>
+              <div style={S.card}>
+                <div style={S.cardTitle}>Site Snapshot</div>
+                <div style={S.siteList}>
+                  {sites.filter(site => staff.some(s => s.site_id === site.id)).slice(0, 10).map(site => {
+                    const siteStaff = staff.filter(s => s.site_id === site.id);
+                    const inToday = attendance.filter(r => r.site_id === site.id && r.date === todayStr()).length;
+                    const liveNow = siteStaff.filter(s => clockedIn[s.id]).length;
+                    return (
+                      <div key={site.id} style={S.siteRow} className="site-row"
+                        onClick={() => { setSelectedSite(site.id); setView("timesheets"); }}>
+                        <div style={S.siteDot} />
+                        <div style={{ flex: 1 }}><div style={S.siteName}>{site.name}</div></div>
+                        <div style={S.siteStats}>
+                          {liveNow > 0 && <span style={S.livePill}>{liveNow} live</span>}
+                          <span style={S.siteCount}>{inToday}/{siteStaff.length}</span>
+                        </div>
+                      </div>
+                    );
+                  })}
+                  <div style={S.moreLink} onClick={() => setView("sites")}>View all {sites.length} sites →</div>
+                </div>
+              </div>
+            </div>
+          </div>
+        )}
+
+        {/* CLOCK IN/OUT */}
+        {view === "clock" && (
+          <div style={S.content}>
+            <div style={S.clockPage}>
+              <div style={S.clockCard}>
+                <div style={S.bigTime}>{time.toLocaleTimeString("en-GB", { hour: "2-digit", minute: "2-digit", second: "2-digit" })}</div>
+                <div style={S.bigDate}>{time.toLocaleDateString("en-GB", { weekday: "long", day: "numeric", month: "long" })}</div>
+                <div style={{ marginBottom: 20 }}>
+                  <select style={{ ...S.select, width: "100%" }} value={selectedSite ?? ""} onChange={e => setSelectedSite(e.target.value === "" ? null : parseInt(e.target.value))}>
+                    <option value="">All Sites</option>
+                    {sites.map(s => <option key={s.id} value={s.id}>{s.name}</option>)}
+                  </select>
+                </div>
+                <div style={S.clockBtns}>
+                  <button style={S.clockInBtn} className="clock-in-btn" onClick={() => handleClockAction("in")}>▶ Clock In</button>
+                  <button style={S.clockOutBtn} className="clock-out-btn" onClick={() => handleClockAction("out")}>■ Clock Out</button>
+                </div>
+                <div style={S.clockHint}>Enter your 4-digit PIN</div>
+              </div>
+              <div style={S.card}>
+                <div style={S.cardTitle}>Today — {totalClockedIn} in, {todayRecs.length} completed</div>
+                {Object.keys(clockedIn).length === 0 && todayRecs.length === 0 && <div style={S.empty}>No activity today yet</div>}
+                {Object.entries(clockedIn).slice(0, 5).map(([id, data]) => {
+                  const s = staff.find(x => x.id === parseInt(id));
+                  if (!s) return null;
+                  return (
+                    <div key={id} style={S.todayRow}>
+                      <div style={S.liveAvatar}>{initials(s.name)}</div>
+                      <div style={{ flex: 1 }}>
+                        <div style={S.liveName}>{s.name} <span style={S.greenPill}>IN</span></div>
+                        <div style={S.liveSub}>{sites.find(x => x.id === s.site_id)?.name}</div>
+                      </div>
+                      <div style={S.liveTime}>{data.time} →</div>
+                    </div>
+                  );
+                })}
+                {todayRecs.slice(0, 5).map(r => {
+                  const s = staff.find(x => x.id === r.staff_id);
+                  if (!s) return null;
+                  return (
+                    <div key={r.id} style={S.todayRow}>
+                      <div style={{ ...S.liveAvatar, background: "#1e1e3a" }}>{initials(s.name)}</div>
+                      <div style={{ flex: 1 }}>
+                        <div style={S.liveName}>{s.name}</div>
+                        <div style={S.liveSub}>{sites.find(x => x.id === r.site_id)?.name}</div>
+                      </div>
+                      <div style={S.liveTime}>{r.clock_in?.slice(0, 5)} → {r.clock_out?.slice(0, 5)}</div>
+                    </div>
+                  );
+                })}
+              </div>
+            </div>
+          </div>
+        )}
+
+        {/* STAFF */}
+        {view === "staff" && (
+          <div style={S.content}>
+            <div style={S.filterRow}>
+              <input style={S.search} placeholder="Search name or role…" value={staffFilter} onChange={e => setStaffFilter(e.target.value)} />
+              <select style={S.select} value={siteFilter} onChange={e => setSiteFilter(e.target.value)}>
+                <option value="all">All Sites ({staff.length} staff)</option>
+                {sites.map(s => <option key={s.id} value={s.id}>{s.name}</option>)}
+              </select>
+            </div>
+            <div style={S.tableWrap}>
+              <table style={S.table}>
+                <thead><tr>{["Name", "Role", "Site", "Contracted", "Status", "PIN", ""].map(h => <th key={h} style={S.th}>{h}</th>)}</tr></thead>
+                <tbody>
+                  {filteredStaff.slice(0, 60).map(s => {
+                    const site = sites.find(x => x.id === s.site_id);
+                    const isIn = !!clockedIn[s.id];
+                    return (
+                      <tr key={s.id} style={S.tr} className="table-row">
+                        <td style={S.td}>
+                          <div style={S.staffCell}>
+                            <div style={S.miniAvatar}>{initials(s.name)}</div>
+                            <div>
+                              <div style={S.staffName}>{s.name}</div>
+                              <div style={S.staffEmail}>{s.email}</div>
+                            </div>
+                          </div>
+                        </td>
+                        <td style={S.td}><span style={S.roleTag}>{s.role || "—"}</span></td>
+                        <td style={S.td}>{site?.name || "—"}</td>
+                        <td style={S.td}>{s.contracted_hours}h</td>
+                        <td style={S.td}>{isIn ? <span style={S.greenPill}>● IN</span> : <span style={S.greyPill}>○ Out</span>}</td>
+                        <td style={S.td}><span style={{ fontFamily: "monospace", color: "#555570" }}>{s.pin}</span></td>
+                        <td style={S.td}><button style={S.viewBtn} onClick={() => { setSiteFilter(String(s.site_id)); setView("timesheets"); }}>View →</button></td>
+                      </tr>
+                    );
+                  })}
+                </tbody>
+              </table>
+              {filteredStaff.length > 60 && <div style={S.moreLink}>Showing 60 of {filteredStaff.length}</div>}
+            </div>
+          </div>
+        )}
+
+        {/* TIMESHEETS */}
+        {view === "timesheets" && (
+          <div style={S.content}>
+            <div style={S.filterRow}>
+              <select style={S.select} value={selectedSite ?? ""} onChange={e => setSelectedSite(e.target.value === "" ? null : parseInt(e.target.value))}>
+                <option value="">All Sites</option>
+                {sites.map(s => <option key={s.id} value={s.id}>{s.name}</option>)}
+              </select>
+              <label style={S.toggleLabel}>
+                <input type="checkbox" checked={approveMode} onChange={e => setApproveMode(e.target.checked)} style={{ marginRight: 6 }} />
+                Approval mode
+              </label>
+              <button style={S.exportBtn} className="export-btn" onClick={exportCSV}>↓ Export CSV</button>
+            </div>
+            <div style={S.tableWrap}>
+              <table style={S.table}>
+                <thead><tr>{["Employee", "Site", "Date", "In", "Out", "Gross", "Break", "Net", "Status", ""].map(h => <th key={h} style={S.th}>{h}</th>)}</tr></thead>
+                <tbody>
+                  {attendance
+                    .filter(r => selectedSite == null || r.site_id === selectedSite)
+                    .slice(0, 80)
+                    .map(r => {
+                      const s = staff.find(x => x.id === r.staff_id);
+                      const site = sites.find(x => x.id === r.site_id);
+                      if (!s) return null;
+                      return (
+                        <tr key={r.id} style={S.tr} className="table-row">
+                          <td style={S.td}>
+                            <div style={S.staffCell}>
+                              <div style={S.miniAvatar}>{initials(s.name)}</div>
+                              <div style={S.staffName}>{s.name}</div>
+                            </div>
+                          </td>
+                          <td style={S.td}>{site?.name}</td>
+                          <td style={S.td}>{fmtDate(r.date)}</td>
+                          <td style={S.td}>{r.clock_in?.slice(0, 5) || "—"}</td>
+                          <td style={S.td}>{r.clock_out ? r.clock_out.slice(0, 5) : <span style={{ color: "#ffb84d" }}>Active</span>}</td>
+                          <td style={S.td}>{r.gross_hours ? `${r.gross_hours}h` : "—"}</td>
+                          <td style={S.td}>{r.break_minutes}m</td>
+                          <td style={S.td}><strong style={{ color: "#00c896" }}>{r.net_hours ? fmt(r.net_hours) : "—"}</strong></td>
+                          <td style={S.td}>{r.approved ? <span style={S.greenPill}>✓ Approved</span> : <span style={S.amberPill}>⏳ Pending</span>}</td>
+                          <td style={S.td}>{approveMode && !r.approved && r.clock_out && <button style={S.approveBtn} onClick={() => approveRecord(r.id)}>Approve</button>}</td>
+                        </tr>
+                      );
+                    })}
+                </tbody>
+              </table>
+            </div>
+          </div>
+        )}
+
+        {/* SITES */}
+        {view === "sites" && (
+          <div style={S.content}>
+            <div style={S.siteGrid}>
+              {sites.map(site => {
+                const siteStaff = staff.filter(s => s.site_id === site.id);
+                const liveNow = siteStaff.filter(s => clockedIn[s.id]).length;
+                const wh = attendance.filter(r => r.site_id === site.id).reduce((sum, r) => sum + (r.net_hours || 0), 0);
+                const pending = attendance.filter(r => r.site_id === site.id && !r.approved && r.clock_out).length;
+                return (
+                  <div key={site.id} style={{ ...S.siteCard, ...(siteStaff.length === 0 ? { opacity: 0.45 } : {}) }}
+                    className="stat-card" onClick={() => { if (siteStaff.length > 0) { setSelectedSite(site.id); setView("timesheets"); } }}>
+                    <div style={S.siteCardTop}>
+                      <div style={{ ...S.siteCardDot, background: siteStaff.length === 0 ? "#333" : "#00c896" }} />
+                      <div style={S.siteCardName}>{site.name}</div>
+                    </div>
+                    <div style={S.siteCardStats}>
+                      <div style={S.siteCardStat}><div style={{ color: "#00c896", fontWeight: 700 }}>{liveNow}</div><div style={S.siteCardStatLabel}>Live</div></div>
+                      <div style={S.siteCardStat}><div style={{ color: "#4da6ff", fontWeight: 700 }}>{siteStaff.length}</div><div style={S.siteCardStatLabel}>Staff</div></div>
+                      <div style={S.siteCardStat}><div style={{ color: "#c084fc", fontWeight: 700 }}>{Math.round(wh)}h</div><div style={S.siteCardStatLabel}>Week</div></div>
+                      <div style={S.siteCardStat}><div style={{ color: pending > 0 ? "#ffb84d" : "#00c896", fontWeight: 700 }}>{pending}</div><div style={S.siteCardStatLabel}>Pending</div></div>
+                    </div>
+                  </div>
+                );
+              })}
+            </div>
+          </div>
+        )}
+
+        {/* REPORTS */}
+        {view === "reports" && (
+          <div style={S.content}>
+            <div style={S.twoCol}>
+              <div style={S.card}>
+                <div style={S.cardTitle}>Export Options</div>
+                <div style={S.reportBtns}>
+                  {[
+                    { label: "All Sites — This Week", desc: "Full payroll export for BrightPay" },
+                    { label: "Pending Approvals Only", desc: "Filter unapproved records" },
+                    { label: "Hours Summary by Site", desc: "Totals per location" },
+                    { label: "Staff vs Contracted Hours", desc: "Highlight over/under" },
+                  ].map(r => (
+                    <div key={r.label} style={S.reportRow} className="site-row" onClick={exportCSV}>
+                      <div>
+                        <div style={S.reportLabel}>{r.label}</div>
+                        <div style={S.reportDesc}>{r.desc}</div>
+                      </div>
+                      <span style={S.exportArrow}>↓</span>
+                    </div>
+                  ))}
+                </div>
+              </div>
+              <div style={S.card}>
+                <div style={S.cardTitle}>Weekly Hours by Site</div>
+                {sites.filter(site => staff.some(s => s.site_id === site.id)).map(site => {
+                  const siteStaff = staff.filter(s => s.site_id === site.id);
+                  const wh = attendance.filter(r => r.site_id === site.id).reduce((sum, r) => sum + (r.net_hours || 0), 0);
+                  const contracted = siteStaff.reduce((sum, s) => sum + (s.contracted_hours || 0), 0);
+                  const pct = Math.min(100, Math.round((wh / Math.max(contracted, 1)) * 100));
+                  return (
+                    <div key={site.id} style={S.barRow}>
+                      <div style={S.barLabel}>{site.name.replace(" Pharmacy", "").substring(0, 14)}</div>
+                      <div style={S.barTrack}><div style={{ ...S.barFill, width: `${pct}%`, background: pct < 80 ? "#ffb84d" : "#00c896" }} /></div>
+                      <div style={S.barVal}>{Math.round(wh)}h</div>
+                    </div>
+                  );
+                })}
+              </div>
+            </div>
+          </div>
+        )}
+      </main>
     </div>
   );
 }
 
-export default App;
+const S = {
+  root:{display:"flex",height:"100vh",background:"#0d0d14",color:"#e8e8f0",fontFamily:"'DM Sans',sans-serif",overflow:"hidden"},
+  spinner:{width:32,height:32,border:"3px solid #1e1e2e",borderTop:"3px solid #00c896",borderRadius:"50%",animation:"spin 1s linear infinite"},
+  sidebar:{width:220,background:"#111120",borderRight:"1px solid #1e1e2e",display:"flex",flexDirection:"column",padding:"24px 0",flexShrink:0},
+  logo:{display:"flex",alignItems:"center",gap:10,padding:"0 20px 24px",borderBottom:"1px solid #1e1e2e"},
+  logoIcon:{width:36,height:36,background:"linear-gradient(135deg,#00c896,#4da6ff)",borderRadius:8,display:"flex",alignItems:"center",justifyContent:"center",fontSize:14,fontWeight:800,color:"#0d0d14",flexShrink:0},
+  logoName:{fontSize:13,fontWeight:700,letterSpacing:1,color:"#e8e8f0"},
+  logoSub:{fontSize:10,color:"#555570",letterSpacing:0.5},
+  nav:{flex:1,padding:"16px 10px"},
+  navItem:{width:"100%",display:"flex",alignItems:"center",gap:10,padding:"10px 12px",background:"transparent",border:"none",color:"#888898",fontSize:13,fontWeight:500,cursor:"pointer",borderRadius:8,textAlign:"left",transition:"all .15s",marginBottom:2},
+  navActive:{background:"#1a1a2e",color:"#00c896"},
+  navIcon:{fontSize:14,width:18,textAlign:"center"},
+  badge:{marginLeft:"auto",background:"#ffb84d",color:"#0d0d14",borderRadius:10,fontSize:10,fontWeight:700,padding:"1px 6px"},
+  sidebarBottom:{padding:"16px 20px",borderTop:"1px solid #1e1e2e",fontSize:11,color:"#555570"},
+  sidebarStat:{display:"flex",alignItems:"center",gap:6,marginBottom:4},
+  sidebarStatNum:{color:"#00c896",fontWeight:700,fontSize:13},
+  main:{flex:1,display:"flex",flexDirection:"column",overflow:"hidden"},
+  header:{padding:"20px 28px",borderBottom:"1px solid #1e1e2e",display:"flex",alignItems:"center",justifyContent:"space-between",background:"#0f0f1a",flexShrink:0},
+  headerTitle:{fontSize:18,fontWeight:700,color:"#e8e8f0"},
+  headerDate:{fontSize:12,color:"#555570",marginTop:2},
+  content:{flex:1,overflow:"auto",padding:"24px 28px"},
+  statsRow:{display:"grid",gridTemplateColumns:"repeat(4,1fr)",gap:16,marginBottom:24},
+  statCard:{background:"#111120",border:"1px solid #1e1e2e",borderRadius:12,padding:"20px",cursor:"pointer"},
+  statNum:{fontSize:32,fontWeight:800,lineHeight:1},
+  statLabel:{fontSize:12,fontWeight:600,color:"#888898",marginTop:6,letterSpacing:0.5,textTransform:"uppercase"},
+  statSub:{fontSize:11,color:"#444458",marginTop:2},
+  twoCol:{display:"grid",gridTemplateColumns:"1fr 1fr",gap:16},
+  card:{background:"#111120",border:"1px solid #1e1e2e",borderRadius:12,padding:"20px"},
+  cardTitle:{fontSize:12,fontWeight:700,color:"#555570",letterSpacing:1,textTransform:"uppercase",marginBottom:16},
+  liveList:{display:"flex",flexDirection:"column",gap:8,maxHeight:320,overflowY:"auto"},
+  liveRow:{display:"flex",alignItems:"center",gap:10,padding:"8px 10px",background:"#0d0d14",borderRadius:8},
+  liveAvatar:{width:32,height:32,background:"linear-gradient(135deg,#00c896,#4da6ff)",borderRadius:8,display:"flex",alignItems:"center",justifyContent:"center",fontSize:11,fontWeight:700,color:"#0d0d14",flexShrink:0},
+  liveName:{fontSize:13,fontWeight:600,color:"#e8e8f0"},
+  liveSub:{fontSize:11,color:"#555570"},
+  liveTime:{fontSize:11,color:"#888898",fontVariantNumeric:"tabular-nums"},
+  siteList:{display:"flex",flexDirection:"column",gap:4},
+  siteRow:{display:"flex",alignItems:"center",gap:8,padding:"8px 10px",borderRadius:8,cursor:"pointer",transition:"background .15s"},
+  siteDot:{width:6,height:6,background:"#00c896",borderRadius:"50%",flexShrink:0},
+  siteName:{fontSize:13,color:"#c8c8d8"},
+  siteStats:{display:"flex",alignItems:"center",gap:6},
+  livePill:{background:"rgba(0,200,150,.15)",color:"#00c896",fontSize:10,fontWeight:700,padding:"2px 6px",borderRadius:10},
+  siteCount:{fontSize:11,color:"#555570"},
+  moreLink:{fontSize:11,color:"#4da6ff",marginTop:12,cursor:"pointer",textAlign:"center"},
+  empty:{fontSize:13,color:"#444458",textAlign:"center",padding:"20px 0"},
+  filterRow:{display:"flex",gap:12,marginBottom:20,alignItems:"center"},
+  search:{flex:1,background:"#111120",border:"1px solid #1e1e2e",borderRadius:8,padding:"10px 14px",color:"#e8e8f0",fontSize:13,outline:"none"},
+  select:{background:"#111120",border:"1px solid #1e1e2e",borderRadius:8,padding:"10px 14px",color:"#e8e8f0",fontSize:13,outline:"none",cursor:"pointer"},
+  toggleLabel:{fontSize:13,color:"#888898",display:"flex",alignItems:"center",cursor:"pointer"},
+  tableWrap:{overflowX:"auto",borderRadius:12,border:"1px solid #1e1e2e"},
+  table:{width:"100%",borderCollapse:"collapse"},
+  th:{background:"#0d0d14",padding:"10px 14px",fontSize:10,fontWeight:700,color:"#555570",textTransform:"uppercase",letterSpacing:0.8,textAlign:"left",borderBottom:"1px solid #1e1e2e",whiteSpace:"nowrap"},
+  tr:{borderBottom:"1px solid #1a1a2a",transition:"background .1s",cursor:"pointer"},
+  td:{padding:"10px 14px",fontSize:13,color:"#c8c8d8",verticalAlign:"middle",whiteSpace:"nowrap"},
+  staffCell:{display:"flex",alignItems:"center",gap:8},
+  miniAvatar:{width:28,height:28,background:"#1e1e3a",borderRadius:6,display:"flex",alignItems:"center",justifyContent:"center",fontSize:10,fontWeight:700,color:"#888898",flexShrink:0},
+  staffName:{fontSize:13,fontWeight:600,color:"#e8e8f0"},
+  staffEmail:{fontSize:10,color:"#444458"},
+  roleTag:{background:"#1a1a2e",color:"#888898",fontSize:10,fontWeight:600,padding:"3px 8px",borderRadius:6,whiteSpace:"nowrap"},
+  greenPill:{background:"rgba(0,200,150,.15)",color:"#00c896",fontSize:10,fontWeight:700,padding:"3px 8px",borderRadius:10},
+  greyPill:{background:"#1a1a2a",color:"#555570",fontSize:10,padding:"3px 8px",borderRadius:10},
+  amberPill:{background:"rgba(255,184,77,.1)",color:"#ffb84d",fontSize:10,fontWeight:700,padding:"3px 8px",borderRadius:10},
+  viewBtn:{background:"transparent",border:"1px solid #2a2a3a",color:"#4da6ff",fontSize:11,padding:"4px 10px",borderRadius:6,cursor:"pointer"},
+  approveBtn:{background:"rgba(0,200,150,.15)",border:"1px solid #00c896",color:"#00c896",fontSize:11,padding:"4px 10px",borderRadius:6,cursor:"pointer"},
+  exportBtn:{background:"#00c896",color:"#0d0d14",border:"none",borderRadius:8,padding:"8px 16px",fontSize:12,fontWeight:700,cursor:"pointer",letterSpacing:0.5},
+  clockPage:{display:"grid",gridTemplateColumns:"1fr 1fr",gap:20},
+  clockCard:{background:"#111120",border:"1px solid #1e1e2e",borderRadius:16,padding:"40px",textAlign:"center"},
+  bigTime:{fontSize:48,fontWeight:800,letterSpacing:2,fontVariantNumeric:"tabular-nums",color:"#e8e8f0"},
+  bigDate:{fontSize:13,color:"#555570",marginTop:4,marginBottom:16},
+  clockBtns:{display:"flex",gap:12,justifyContent:"center",marginBottom:16},
+  clockInBtn:{background:"#00c896",color:"#0d0d14",border:"none",borderRadius:10,padding:"14px 28px",fontSize:15,fontWeight:700,cursor:"pointer"},
+  clockOutBtn:{background:"transparent",color:"#ff6b6b",border:"2px solid #ff6b6b",borderRadius:10,padding:"14px 28px",fontSize:15,fontWeight:700,cursor:"pointer"},
+  clockHint:{fontSize:11,color:"#444458"},
+  todayRow:{display:"flex",alignItems:"center",gap:10,padding:"8px 10px",borderRadius:8,marginBottom:6},
+  overlay:{position:"fixed",inset:0,background:"rgba(0,0,0,.75)",display:"flex",alignItems:"center",justifyContent:"center",zIndex:1000},
+  modal:{background:"#111120",border:"1px solid #2a2a3a",borderRadius:16,padding:"32px",width:300,textAlign:"center"},
+  modalTitle:{fontSize:11,fontWeight:800,letterSpacing:2,color:"#555570",marginBottom:8},
+  clockTime:{fontSize:32,fontWeight:800,color:"#e8e8f0",fontVariantNumeric:"tabular-nums",marginBottom:20},
+  pinDisplay:{display:"flex",justifyContent:"center",gap:16,marginBottom:12},
+  pinDot:{width:16,height:16,border:"2px solid #2a2a3a",borderRadius:"50%",transition:"background .1s"},
+  pinError:{fontSize:12,color:"#ff6b6b",marginBottom:8},
+  pinGrid:{display:"grid",gridTemplateColumns:"repeat(3,1fr)",gap:8,marginBottom:16},
+  pinBtn:{background:"#1a1a2a",border:"1px solid #2a2a3a",color:"#e8e8f0",fontSize:18,fontWeight:600,padding:"14px",borderRadius:10,cursor:"pointer"},
+  cancelBtn:{background:"transparent",border:"none",color:"#555570",fontSize:13,cursor:"pointer"},
+  siteGrid:{display:"grid",gridTemplateColumns:"repeat(4,1fr)",gap:12},
+  siteCard:{background:"#111120",border:"1px solid #1e1e2e",borderRadius:12,padding:16,cursor:"pointer"},
+  siteCardTop:{display:"flex",alignItems:"center",gap:8,marginBottom:12},
+  siteCardDot:{width:8,height:8,borderRadius:"50%",flexShrink:0},
+  siteCardName:{fontSize:11,fontWeight:600,color:"#c8c8d8"},
+  siteCardStats:{display:"grid",gridTemplateColumns:"1fr 1fr",gap:8},
+  siteCardStat:{textAlign:"center",background:"#0d0d14",borderRadius:8,padding:"8px"},
+  siteCardStatLabel:{fontSize:10,color:"#444458",marginTop:2},
+  reportBtns:{display:"flex",flexDirection:"column",gap:8},
+  reportRow:{display:"flex",alignItems:"center",justifyContent:"space-between",padding:"12px 16px",background:"#0d0d14",borderRadius:8,cursor:"pointer"},
+  reportLabel:{fontSize:13,fontWeight:600,color:"#e8e8f0"},
+  reportDesc:{fontSize:11,color:"#555570",marginTop:2},
+  exportArrow:{fontSize:18,color:"#4da6ff"},
+  barRow:{display:"flex",alignItems:"center",gap:10,marginBottom:10},
+  barLabel:{fontSize:11,color:"#888898",width:100,flexShrink:0},
+  barTrack:{flex:1,height:6,background:"#1a1a2a",borderRadius:3,overflow:"hidden"},
+  barFill:{height:"100%",borderRadius:3,transition:"width .3s"},
+  barVal:{fontSize:11,color:"#c8c8d8",width:36,textAlign:"right"},
+  notif:{position:"fixed",top:20,right:20,zIndex:2000,color:"#0d0d14",fontWeight:700,fontSize:13,padding:"12px 20px",borderRadius:10,boxShadow:"0 4px 20px rgba(0,0,0,.4)"},
+};
+
+const css = `
+  @import url('https://fonts.googleapis.com/css2?family=DM+Sans:wght@400;500;600;700;800&display=swap');
+  * { box-sizing: border-box; }
+  @keyframes spin { to { transform: rotate(360deg); } }
+  ::-webkit-scrollbar { width: 4px; height: 4px; }
+  ::-webkit-scrollbar-track { background: #0d0d14; }
+  ::-webkit-scrollbar-thumb { background: #2a2a3a; border-radius: 4px; }
+  .nav-item:hover { background: #1a1a2e !important; color: #c8c8d8 !important; }
+  .stat-card:hover { border-color: #2a2a3a !important; transform: translateY(-1px); transition: all .15s; }
+  .table-row:hover td { background: #13131f; }
+  .site-row:hover { background: #13131f !important; }
+  .pin-btn:hover { background: #2a2a3a !important; }
+  .clock-in-btn:hover { opacity: 0.9; }
+  .clock-out-btn:hover { background: rgba(255,107,107,.1) !important; }
+  .export-btn:hover { opacity: 0.9; }
+`;
