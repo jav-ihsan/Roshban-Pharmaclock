@@ -36,9 +36,10 @@ const makeDb = (token) => ({
   async get(table, params = "") {
     const res = await fetch(`${SUPABASE_URL}/rest/v1/${table}${params}`, {
       headers: {
-  apikey: SUPABASE_KEY,
-  Authorization: `Bearer ${token}`,
-  "Content-Type": "application/json",
+        apikey: SUPABASE_KEY,
+        Authorization: `Bearer ${token}`,
+        "Content-Type": "application/json",
+        "Range": "0-999",
   "Range-Unit": "items",
   "Range": "0-999",
   "Prefer": "count=none",
