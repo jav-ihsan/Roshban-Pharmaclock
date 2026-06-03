@@ -453,6 +453,7 @@ function MainApp({ token, userMeta, onLogout }) {
     {id:"timesheets",label:"Timesheets",icon:"▦"},
     ...(isAdmin ? [{id:"sites",label:"Sites",icon:"◉"}] : []),
     {id:"reports",label:"Reports",icon:"▤"},
+    ...(isAdmin ? [{id:"pins",label:"Manage PINs",icon:"◆"}] : []),
   ];
 
   if (loading) return (
@@ -706,7 +707,121 @@ function MainApp({ token, userMeta, onLogout }) {
             </div>
           </div>
         )}
+
+        {/* PIN MANAGEMENT - Admin only */}
+        {view==="pins"&&isAdmin&&(
+          <div style={S.content}>
+            <PinManager staff={staff} sites={sites} db={db} />
+          </div>
+        )}
       </main>
+    </div>
+  );
+}
+
+
+// ── PIN Manager Component ─────────────────────────────────────────────────────
+function PinManager({ staff, sites, db }) {
+  const [search, setSearch] = useState("");
+  const [editing, setEditing] = useState(null); // staffId
+  const [newPin, setNewPin] = useState("");
+  const [saving, setSaving] = useState(false);
+  const [saved, setSaved] = useState(null);
+  const [error, setError] = useState("");
+
+  const filtered = staff.filter(s =>
+    s.name.toLowerCase().includes(search.toLowerCase()) ||
+    (sites.find(x=>x.id===s.site_id)?.name||"").toLowerCase().includes(search.toLowerCase())
+  );
+
+  const savePin = async (staffId) => {
+    if (!/^[0-9]{4}$/.test(newPin)) { setError("PIN must be exactly 4 digits"); return; }
+    setSaving(true); setError("");
+    try {
+      await db.patch("staff", staffId, { pin: newPin });
+      setSaved(staffId);
+      setEditing(null);
+      setNewPin("");
+      setTimeout(() => setSaved(null), 3000);
+    } catch (e) {
+      setError("Failed to save — try again");
+    } finally {
+      setSaving(false);
+    }
+  };
+
+  return (
+    <div>
+      <div style={{marginBottom:20,display:"flex",alignItems:"center",gap:12}}>
+        <input style={{...{flex:1,background:"#111120",border:"1px solid #1e1e2e",borderRadius:8,padding:"10px 14px",color:"#e8e8f0",fontSize:13,outline:"none"}}}
+          placeholder="Search staff or site…" value={search} onChange={e=>setSearch(e.target.value)} />
+        <div style={{fontSize:12,color:"#555570"}}>{filtered.length} staff</div>
+      </div>
+      {saved && <div style={{background:"rgba(0,200,150,.15)",border:"1px solid #00c896",color:"#00c896",padding:"10px 16px",borderRadius:8,marginBottom:16,fontSize:13}}>✓ PIN updated successfully</div>}
+      <div style={{borderRadius:12,border:"1px solid #1e1e2e",overflow:"hidden"}}>
+        <table style={{width:"100%",borderCollapse:"collapse"}}>
+          <thead>
+            <tr>{["Staff Member","Site","Role","Current PIN","New PIN",""].map(h=><th key={h} style={{background:"#0d0d14",padding:"10px 14px",fontSize:10,fontWeight:700,color:"#555570",textTransform:"uppercase",letterSpacing:0.8,textAlign:"left",borderBottom:"1px solid #1e1e2e"}}>{h}</th>)}</tr>
+          </thead>
+          <tbody>
+            {filtered.slice(0,60).map(s => {
+              const site = sites.find(x=>x.id===s.site_id);
+              const isEditing = editing === s.id;
+              return (
+                <tr key={s.id} style={{borderBottom:"1px solid #1a1a2a"}}>
+                  <td style={{padding:"10px 14px",fontSize:13,color:"#e8e8f0",fontWeight:600}}>
+                    <div style={{display:"flex",alignItems:"center",gap:8}}>
+                      <div style={{width:28,height:28,background:"#1e1e3a",borderRadius:6,display:"flex",alignItems:"center",justifyContent:"center",fontSize:10,fontWeight:700,color:"#888898",flexShrink:0}}>
+                        {s.name.split(" ").map(w=>w[0]).join("").slice(0,2).toUpperCase()}
+                      </div>
+                      {s.name}
+                    </div>
+                  </td>
+                  <td style={{padding:"10px 14px",fontSize:12,color:"#888898"}}>{site?.name||"—"}</td>
+                  <td style={{padding:"10px 14px",fontSize:12,color:"#888898"}}>{s.role||"—"}</td>
+                  <td style={{padding:"10px 14px"}}>
+                    <span style={{fontFamily:"monospace",fontSize:16,letterSpacing:4,color:"#00c896",fontWeight:700}}>{s.pin}</span>
+                  </td>
+                  <td style={{padding:"10px 14px"}}>
+                    {isEditing ? (
+                      <div style={{display:"flex",gap:8,alignItems:"center"}}>
+                        <input
+                          style={{width:80,background:"#0d0d14",border:"1px solid #00c896",borderRadius:6,padding:"6px 10px",color:"#e8e8f0",fontSize:14,fontFamily:"monospace",letterSpacing:4,outline:"none",textAlign:"center"}}
+                          maxLength={4} placeholder="____" value={newPin}
+                          onChange={e=>{ setNewPin(e.target.value.replace(/[^0-9]/g,"")); setError(""); }}
+                          autoFocus
+                        />
+                        {error && <span style={{fontSize:11,color:"#ff6b6b"}}>{error}</span>}
+                      </div>
+                    ) : (
+                      <span style={{fontSize:12,color:"#444458"}}>—</span>
+                    )}
+                  </td>
+                  <td style={{padding:"10px 14px"}}>
+                    {isEditing ? (
+                      <div style={{display:"flex",gap:6}}>
+                        <button style={{background:"#00c896",color:"#0d0d14",border:"none",borderRadius:6,padding:"6px 12px",fontSize:12,fontWeight:700,cursor:"pointer"}}
+                          onClick={()=>savePin(s.id)} disabled={saving}>
+                          {saving?"…":"Save"}
+                        </button>
+                        <button style={{background:"transparent",border:"1px solid #2a2a3a",color:"#888898",borderRadius:6,padding:"6px 12px",fontSize:12,cursor:"pointer"}}
+                          onClick={()=>{setEditing(null);setNewPin("");setError("");}}>
+                          Cancel
+                        </button>
+                      </div>
+                    ) : (
+                      <button style={{background:"transparent",border:"1px solid #2a2a3a",color:"#4da6ff",fontSize:11,padding:"5px 12px",borderRadius:6,cursor:"pointer"}}
+                        onClick={()=>{setEditing(s.id);setNewPin("");setError("");}}>
+                        Change PIN
+                      </button>
+                    )}
+                  </td>
+                </tr>
+              );
+            })}
+          </tbody>
+        </table>
+      </div>
     </div>
   );
 }
