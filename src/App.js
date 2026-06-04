@@ -606,7 +606,7 @@ function MainApp({ token, userMeta, onLogout }) {
               <table style={S.table}>
                 <thead><tr>{["Name","Role","Site","Contracted","Status","PIN",""].map(h=><th key={h} style={S.th}>{h}</th>)}</tr></thead>
                 <tbody>
-                  {filteredStaff.slice(0,60).map(s=>{
+                  {filteredStaff.slice(0,500).map(s=>{
                     const site=sites.find(x=>x.id===s.site_id); const isIn=!!clockedIn[s.id];
                     return(<tr key={s.id} style={S.tr} className="table-row">
                       <td style={S.td}><div style={S.staffCell}><div style={S.miniAvatar}>{initials(s.name)}</div><div><div style={S.staffName}>{s.name}</div><div style={S.staffEmail}>{s.email}</div></div></div></td>
