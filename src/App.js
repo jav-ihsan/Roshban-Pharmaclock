@@ -768,7 +768,7 @@ function PinManager({ staff, sites, db }) {
             <tr>{["Staff Member","Site","Role","Current PIN","New PIN",""].map(h=><th key={h} style={{background:"#0d0d14",padding:"10px 14px",fontSize:10,fontWeight:700,color:"#555570",textTransform:"uppercase",letterSpacing:0.8,textAlign:"left",borderBottom:"1px solid #1e1e2e"}}>{h}</th>)}</tr>
           </thead>
           <tbody>
-            {filtered.slice(0,60).map(s => {
+            {filtered.slice(0,500).map(s => {
               const site = sites.find(x=>x.id===s.site_id);
               const isEditing = editing === s.id;
               return (
